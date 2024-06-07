@@ -5,13 +5,17 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 )
 
 const (
-	TilePacketType    uint32 = 1
-	ControlPacketType uint32 = 3
-	AudioPacketType   uint32 = 2
+	ReadyPacketType       uint32 = 0
+	TilePacketType        uint32 = 1
+	AudioPacketType       uint32 = 2
+	ControlPacketType     uint32 = 3
+	TrackStatusPacketType uint32 = 4
 )
 
 // TODO seperate this into different struct. We also want to use packet type for control packets (i.e. fov)
@@ -62,7 +66,7 @@ type ProxyConnection struct {
 	// Cond gives better performance compared to high priority lock
 	// High prio lock => latency between 3 and 10ms
 	// Condi lock => latency between 0 and 1ms
-	cond_video *sync.Cond
+	cond_video map[uint32]*sync.Cond // TODO add one for every tile
 	mtx_video  sync.Mutex
 
 	cond_audio *sync.Cond
@@ -76,7 +80,7 @@ func NewProxyConnection() *ProxyConnection {
 		make(map[uint32]map[uint32]RemoteTile), make(map[uint32][]RemoteTile), // Video
 		make(map[uint32]RemoteTile), make([]RemoteTile, 0), // Audio
 		make(map[uint32]uint32), sync.Mutex{},
-		nil, sync.Mutex{}, // Video mutex
+		make(map[uint32]*sync.Cond), sync.Mutex{}, // Video mutex
 		nil, sync.Mutex{}, // Audio mutex
 	}
 }
@@ -109,10 +113,28 @@ func (pc *ProxyConnection) SetupConnection(port string) {
 	}
 
 	// Create a buffer to read incoming messages
+	port_info := strings.Split(port, ":")
+	if port_info[0] == "" {
+		port_int, _ := strconv.Atoi(port_info[1])
+		port_string := strconv.Itoa(port_int + 1)
+		port = "127.0.0.1:" + port_string
+	} else {
+		port_int, _ := strconv.Atoi(port_info[1])
+		port_string := strconv.Itoa(port_int + 1)
+		port = port_info[0] + ":" + port_string
+	}
+
+	pc.addr, err = net.ResolveUDPAddr("udp", port)
+	if err != nil {
+		fmt.Printf("WebRTCPeer: ERROR: %s\n", err)
+		return
+	}
+
+	pc.SendPeerReadyPacket()
 	buffer := make([]byte, 1500)
 
 	// Wait for incoming messages
-	fmt.Println("WebRTCPeer: Waiting for a message...")
+	fmt.Println("WebRTCPeer: Waiting for a message...", port, pc.addr.IP.String())
 	_, pc.addr, err = pc.conn.ReadFromUDP(buffer)
 	if err != nil {
 		fmt.Printf("WebRTCPeer: ERROR: %s\n", err)
@@ -120,12 +142,15 @@ func (pc *ProxyConnection) SetupConnection(port string) {
 	}
 
 	fmt.Println("WebRTCPeer: Connected to Unity DLL")
+
 }
 
 func (pc *ProxyConnection) StartListening() {
 	println("WebRTCPeer: Start listening for incoming data from DLL")
-	pc.cond_video = sync.NewCond(&pc.mtx_video)
 	pc.cond_audio = sync.NewCond(&pc.mtx_audio)
+	for i := 0; i < 3; i++ {
+		pc.cond_video[uint32(i)] = sync.NewCond(&pc.mtx_video)
+	}
 	go func() {
 		for {
 			buffer := make([]byte, 1500)
@@ -158,6 +183,7 @@ func (pc *ProxyConnection) StartListening() {
 					//fmt.Printf("WebRTCPeer: [VIDEO] DLL first packet of frame %d from tile %d with length %d  at %d\n",
 					//	p.FrameNr, p.TileNr, p.FrameLen, time.Now().UnixNano()/int64(time.Millisecond))
 				}
+
 				value := pc.incomplete_tiles[p.TileNr][p.FrameNr]
 				copy(value.fileData[p.FrameOffset:p.FrameOffset+p.PacketLen], buffer[28:28+p.PacketLen])
 				value.currentLen = value.currentLen + p.PacketLen
@@ -173,7 +199,7 @@ func (pc *ProxyConnection) StartListening() {
 					// TODO use channels instead
 					pc.complete_tiles[p.TileNr][0] = value
 					delete(pc.incomplete_tiles[p.TileNr], p.FrameNr)
-					pc.cond_video.Broadcast()
+					pc.cond_video[p.TileNr].Broadcast()
 				}
 				pc.mtx_video.Unlock()
 				//pc.m.Unlock()
@@ -223,6 +249,10 @@ func (pc *ProxyConnection) StartListening() {
 	}()
 }
 
+func (pc *ProxyConnection) SendPeerReadyPacket() {
+	pc.sendPacket(make([]byte, 100), 0, ReadyPacketType)
+}
+
 func (pc *ProxyConnection) SendTilePacket(b []byte, offset uint32) {
 	pc.sendPacket(b, offset, TilePacketType)
 }
@@ -233,6 +263,24 @@ func (pc *ProxyConnection) SendAudioPacket(b []byte, offset uint32) {
 
 func (pc *ProxyConnection) SendControlPacket(b []byte) {
 	pc.sendPacket(b, 0, ControlPacketType)
+}
+
+func (pc *ProxyConnection) SendTrackStatusPacket(clientID uint32, tileID uint32, isVideo bool, wasAdded bool) {
+	b := make([]byte, 4+4+1+1)
+	binary.LittleEndian.PutUint32(b[0:], clientID)
+	binary.LittleEndian.PutUint32(b[4:], tileID)
+	if isVideo {
+		b[8] = 1
+	} else {
+		b[8] = 0
+	}
+
+	if wasAdded {
+		b[9] = 1
+	} else {
+		b[9] = 0
+	}
+	pc.sendPacket(b, 0, TrackStatusPacketType)
 }
 
 func (pc *ProxyConnection) NextTile(tile uint32) []byte {
@@ -247,7 +295,7 @@ func (pc *ProxyConnection) NextTile(tile uint32) []byte {
 		if len(pc.complete_tiles[tile]) > 0 {
 			isNextFrameReady = true
 		} else {
-			pc.cond_video.Wait()
+			pc.cond_video[tile].Wait()
 			isNextFrameReady = true
 			//pc.m.HighPriorityUnlock()
 			//time.Sleep(time.Millisecond)

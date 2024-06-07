@@ -250,16 +250,21 @@ func main() {
 				}
 
 			}()
-			for {
-				targetBitrate := uint32(estimator.GetTargetBitrate())
-				transcoder.UpdateBitrate(targetBitrate)
-				for i := 0; i < *numberOfTiles; i++ {
-					// TODO maybe change writeframe into goroutines?
-					if err = videoTracks[i].WriteFrame(transcoder, uint32(i)); err != nil {
-						panic(err)
+			targetBitrate := uint32(estimator.GetTargetBitrate())
+			transcoder.UpdateBitrate(targetBitrate)
+			for i := 0; i < *numberOfTiles; i++ {
+				// TODO maybe change writeframe into goroutines?
+				go func(tileNr int) {
+					for {
+						if err = videoTracks[tileNr].WriteFrame(transcoder, uint32(tileNr)); err != nil {
+							//panic(err)
+						}
 					}
-				}
+				}(i)
 			}
+			//for {
+
+			//}
 		}
 	})
 
@@ -269,10 +274,18 @@ func main() {
 		fmt.Printf("WebRTCPeer: Track SSRC %d\n", track.SSRC())
 		// TODO: check the puprose of this code fragment
 		// Currently this removes stuff like audio_1 (audio track second client) and video_X_1 (second tile for user X)?
-		if track.ID()[len(track.ID())-1] == '1' && track.Kind() == webrtc.RTPCodecTypeVideo {
-			wsHandler.SendMessage(WebsocketPacket{1, 5, track.ID()})
+		//if track.ID()[len(track.ID())-1] == '1' && track.Kind() == webrtc.RTPCodecTypeVideo {
+		//		wsHandler.SendMessage(WebsocketPacket{1, 5, track.ID()})
+		//	}
+		trackIdTokens := strings.Split(track.ID(), "_")
+		isVideo := false
+		clientID, _ := strconv.ParseUint(trackIdTokens[1], 10, 32)
+		trackID := uint64(0)
+		if trackIdTokens[0] == "video" {
+			isVideo = true
+			trackID, _ = strconv.ParseUint(trackIdTokens[2], 10, 32)
 		}
-
+		proxyConn.SendTrackStatusPacket(uint32(clientID), uint32(trackID), isVideo, true)
 		codecName := strings.Split(track.Codec().RTPCodecCapability.MimeType, "/")
 		fmt.Printf("WebRTCPeer: Track of type %d has started: %s\n", track.PayloadType(), codecName)
 
@@ -282,11 +295,13 @@ func main() {
 
 		// Allows to check if frames are received completely
 		frames := make(map[uint32]uint32)
+		//prevFrame := -1
 		// TODO: make clean seperated function for audio / video so we dont constantly need to do the kind check
 		for {
 			_, _, readErr := track.Read(buf)
 			if readErr != nil {
 				fmt.Printf("WebRTCPeer: Can no longer read from track %s, terminating %s\n", track.ID(), readErr.Error())
+
 				break
 			}
 			if *useProxyOutput {
@@ -309,7 +324,12 @@ func main() {
 				}
 
 				frames[p.FrameNr] += p.SeqLen
-				if frames[p.FrameNr] == p.FrameLen {
+				/*	if prevFrame != int(p.FrameNr) {
+					fmt.Printf("WebRTCPeer: [VIDEO] Received video frame %d from client %d and tile %d with length %d\n",
+						p.FrameNr, p.ClientNr, frames[uint32(prevFrame)], p.FrameLen)
+					prevFrame = int(p.FrameNr)
+				}*/
+				if frames[p.FrameNr] == p.FrameLen && p.FrameNr%10 == 0 {
 					fmt.Printf("WebRTCPeer: [VIDEO] Received video frame %d from client %d and tile %d with length %d\n",
 						p.FrameNr, p.ClientNr, p.TileNr, p.FrameLen)
 				}
@@ -324,7 +344,7 @@ func main() {
 					panic(err)
 				}
 				frames[p.FrameNr] += p.SeqLen
-				if frames[p.FrameNr] == p.FrameLen {
+				if frames[p.FrameNr] == p.FrameLen && p.FrameNr%100 == 0 {
 					fmt.Printf("WebRTCPeer: [AUDIO] Received audio frame %d from client %d with length %d\n",
 						p.FrameNr, p.ClientNr, p.FrameLen)
 				}
