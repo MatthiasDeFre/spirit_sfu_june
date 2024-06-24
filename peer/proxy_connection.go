@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -71,6 +72,8 @@ type ProxyConnection struct {
 
 	cond_audio *sync.Cond
 	mtx_audio  sync.Mutex
+
+	wsHandler *WebsocketHandler
 }
 
 type SetupCallback func(int)
@@ -82,6 +85,7 @@ func NewProxyConnection() *ProxyConnection {
 		make(map[uint32]uint32), sync.Mutex{},
 		make(map[uint32]*sync.Cond), sync.Mutex{}, // Video mutex
 		nil, sync.Mutex{}, // Audio mutex
+		nil,
 	}
 }
 
@@ -243,6 +247,15 @@ func (pc *ProxyConnection) StartListening() {
 					pc.cond_audio.Broadcast()
 				}
 				pc.mtx_audio.Unlock()
+			} else if ptype == ControlPacketType {
+				if pc.wsHandler != nil {
+					pc.wsHandler.SendMessage(WebsocketPacket{
+						uint64(*clientID),
+						7,
+						string(buffer[4:]),
+					})
+				}
+
 			}
 
 		}
@@ -265,20 +278,21 @@ func (pc *ProxyConnection) SendControlPacket(b []byte) {
 	pc.sendPacket(b, 0, ControlPacketType)
 }
 
-func (pc *ProxyConnection) SendTrackStatusPacket(clientID uint32, tileID uint32, isVideo bool, wasAdded bool) {
-	b := make([]byte, 4+4+1+1)
+func (pc *ProxyConnection) SendTrackStatusPacket(clientID uint32, lastFrameNr uint32, tileID uint32, isVideo bool, wasAdded bool) {
+	b := make([]byte, 4+4+4+1+1)
 	binary.LittleEndian.PutUint32(b[0:], clientID)
-	binary.LittleEndian.PutUint32(b[4:], tileID)
+	binary.LittleEndian.PutUint32(b[4:], lastFrameNr)
+	binary.LittleEndian.PutUint32(b[8:], tileID)
 	if isVideo {
-		b[8] = 1
+		b[12] = 1
 	} else {
-		b[8] = 0
+		b[12] = 0
 	}
 
 	if wasAdded {
-		b[9] = 1
+		b[13] = 1
 	} else {
-		b[9] = 0
+		b[13] = 0
 	}
 	pc.sendPacket(b, 0, TrackStatusPacketType)
 }
@@ -302,9 +316,12 @@ func (pc *ProxyConnection) NextTile(tile uint32) []byte {
 		}
 	}
 	data := pc.complete_tiles[tile][0].fileData
-	//frameNr := pc.complete_tiles[tile][0].frameNr
-	//fmt.Printf("WebRTCPeer: [VIDEO] Sending out frame %d from tile %d with size %d at %d\n",
-	//	frameNr, tile, pc.complete_tiles[tile][0].fileLen, time.Now().UnixNano()/int64(time.Millisecond))
+	frameNr := pc.complete_tiles[tile][0].frameNr
+	if frameNr%10 == 0 {
+		fmt.Printf("WebRTCPeer: [VIDEO] Sending out frame %d from tile %d with size %d at %d\n",
+			frameNr, tile, pc.complete_tiles[tile][0].fileLen, time.Now().UnixNano()/int64(time.Millisecond))
+	}
+
 	delete(pc.complete_tiles, tile)
 	// Do we still need frame counter? Seems more logical to use the actual frame nr
 	pc.frame_counters[tile] += 1

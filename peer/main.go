@@ -13,8 +13,6 @@ import (
 	"time"
 
 	"github.com/pion/interceptor"
-	"github.com/pion/interceptor/pkg/cc"
-	"github.com/pion/interceptor/pkg/gcc"
 	"github.com/pion/interceptor/pkg/nack"
 	"github.com/pion/interceptor/pkg/twcc"
 	"github.com/pion/rtp"
@@ -105,25 +103,25 @@ func main() {
 	}, webrtc.RTPCodecTypeAudio); err != nil {
 		panic(err)
 	}
-	congestionController, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
-		return gcc.NewSendSideBWE(gcc.SendSideBWEMinBitrate(75_000*8), gcc.SendSideBWEInitialBitrate(75_000_000), gcc.SendSideBWEMaxBitrate(262_744_320))
-	})
-	if err != nil {
-		panic(err)
-	}
+	//congestionController, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
+	//	return gcc.NewSendSideBWE(gcc.SendSideBWEMinBitrate(75_000*8), gcc.SendSideBWEInitialBitrate(75_000_000), gcc.SendSideBWEMaxBitrate(262_744_320))
+	//})
+	//if err != nil {
+	//	panic(err)
+	//}
 
 	m.RegisterFeedback(webrtc.RTCPFeedback{Type: "nack"}, webrtc.RTPCodecTypeVideo)
 	m.RegisterFeedback(webrtc.RTCPFeedback{Type: "nack", Parameter: "pli"}, webrtc.RTPCodecTypeVideo)
 
-	estimatorChan := make(chan cc.BandwidthEstimator, 1)
-	congestionController.OnNewPeerConnection(func(id string, estimator cc.BandwidthEstimator) {
-		estimatorChan <- estimator
-	})
+	//estimatorChan := make(chan cc.BandwidthEstimator, 1)
+	//congestionController.OnNewPeerConnection(func(id string, estimator cc.BandwidthEstimator) {
+	//	estimatorChan <- estimator
+	//})
 
-	i.Add(congestionController)
-	if err = webrtc.ConfigureTWCCHeaderExtensionSender(m, i); err != nil {
-		panic(err)
-	}
+	//i.Add(congestionController)
+	//if err = webrtc.ConfigureTWCCHeaderExtensionSender(m, i); err != nil {
+	//	panic(err)
+	//}
 
 	responder, _ := nack.NewResponderInterceptor()
 	i.Add(responder)
@@ -212,10 +210,11 @@ func main() {
 		}
 	}()
 
-	estimator := <-estimatorChan
+	//estimator := <-estimatorChan
 
 	// Create custom websocket handler on SFU address
 	wsHandler := NewWSHandler(*sfuAddress, "/websocket")
+	proxyConn.wsHandler = wsHandler
 
 	peerConnection.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
@@ -227,7 +226,7 @@ func main() {
 			pendingCandidates = append(pendingCandidates, c)
 		} else {
 			payload := []byte(c.ToJSON().Candidate)
-			wsHandler.SendMessage(WebsocketPacket{1, 4, string(payload)})
+			wsHandler.SendMessage(WebsocketPacket{uint64(*clientID), 4, string(payload)})
 		}
 		candidatesMux.Unlock()
 	})
@@ -250,8 +249,8 @@ func main() {
 				}
 
 			}()
-			targetBitrate := uint32(estimator.GetTargetBitrate())
-			transcoder.UpdateBitrate(targetBitrate)
+			//targetBitrate := uint32(estimator.GetTargetBitrate())
+			transcoder.UpdateBitrate(0)
 			for i := 0; i < *numberOfTiles; i++ {
 				// TODO maybe change writeframe into goroutines?
 				go func(tileNr int) {
@@ -285,7 +284,7 @@ func main() {
 			isVideo = true
 			trackID, _ = strconv.ParseUint(trackIdTokens[2], 10, 32)
 		}
-		proxyConn.SendTrackStatusPacket(uint32(clientID), uint32(trackID), isVideo, true)
+		proxyConn.SendTrackStatusPacket(uint32(clientID), 0, uint32(trackID), isVideo, true)
 		codecName := strings.Split(track.Codec().RTPCodecCapability.MimeType, "/")
 		fmt.Printf("WebRTCPeer: Track of type %d has started: %s\n", track.PayloadType(), codecName)
 
@@ -297,11 +296,12 @@ func main() {
 		frames := make(map[uint32]uint32)
 		//prevFrame := -1
 		// TODO: make clean seperated function for audio / video so we dont constantly need to do the kind check
+		lastFrameNr := 0
 		for {
 			_, _, readErr := track.Read(buf)
 			if readErr != nil {
 				fmt.Printf("WebRTCPeer: Can no longer read from track %s, terminating %s\n", track.ID(), readErr.Error())
-
+				proxyConn.SendTrackStatusPacket(uint32(clientID), uint32(lastFrameNr), uint32(trackID), isVideo, false)
 				break
 			}
 			if *useProxyOutput {
@@ -329,6 +329,10 @@ func main() {
 						p.FrameNr, p.ClientNr, frames[uint32(prevFrame)], p.FrameLen)
 					prevFrame = int(p.FrameNr)
 				}*/
+				if frames[p.FrameNr] == p.FrameLen {
+					lastFrameNr = int(p.FrameNr)
+				}
+
 				if frames[p.FrameNr] == p.FrameLen && p.FrameNr%10 == 0 {
 					fmt.Printf("WebRTCPeer: [VIDEO] Received video frame %d from client %d and tile %d with length %d\n",
 						p.FrameNr, p.ClientNr, p.TileNr, p.FrameLen)
@@ -372,7 +376,7 @@ func main() {
 			if err != nil {
 				panic(err)
 			}
-			wsHandler.SendMessage(WebsocketPacket{1, 2, string(payload)})
+			wsHandler.SendMessage(WebsocketPacket{uint64(*clientID), 2, string(payload)})
 			state = Hello
 			fmt.Printf("WebRTCPeer: Current state: %d\n", state)
 		case 2: // offer
@@ -397,7 +401,7 @@ func main() {
 			if err != nil {
 				panic(err)
 			}
-			wsHandler.SendMessage(WebsocketPacket{1, 3, string(payload)})
+			wsHandler.SendMessage(WebsocketPacket{uint64(*clientID), 3, string(payload)})
 			state = Offer
 			fmt.Printf("WebRTCPeer: Current state: %d\n", state)
 		case 3: // answer
@@ -413,7 +417,7 @@ func main() {
 			candidatesMux.Lock()
 			for _, c := range pendingCandidates {
 				payload := []byte(c.ToJSON().Candidate)
-				wsHandler.SendMessage(WebsocketPacket{1, 4, string(payload)})
+				wsHandler.SendMessage(WebsocketPacket{uint64(*clientID), 4, string(payload)})
 			}
 			candidatesMux.Unlock()
 			state = Answer
